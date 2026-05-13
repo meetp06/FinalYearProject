@@ -21,5 +21,21 @@ models/*/rng_state.pth
 models/*/scheduler.pt
 models/*/training_args.bin
 
+# Large tokenizer files (~11-16MB each) — not needed on GitHub
+models/*/tokenizer.json
+
+# Trainer state logs (44KB each, not needed)
+models/*/trainer_state.json
+
+# Poster binaries — generated files
+eval/poster/*.pptx
+eval/poster/*.pdf
+
 # Eval scratch outputs
 eval/smoke_test.md
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo

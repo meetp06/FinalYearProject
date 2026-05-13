@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -127,19 +128,64 @@ def chat(req: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
     )
     if id_response is not None:
         customer_just_verified = bool(chat_session.customer_id and not _customer_id_before)
+        reply_text = id_response
+        invocations: list = []
+        id_rag_sources: list = []
+
+        # Issue 5: if verification just succeeded AND the message has a real query
+        # beyond bare credentials, run the agent so the reply covers both in one turn.
+        if customer_just_verified:
+            _cred_stripped = re.sub(
+                r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'
+                r'|\bORD-[\w-]+\b'
+                r'|(?:my\s+)?e-?mail(?:\s+address)?(?:\s+is)?\s*'
+                r'|(?:my\s+)?order(?:\s+(?:number|#|id))?\s+(?:is\s+)?'
+                r'|\bmy\s+name\s+is\b',
+                '',
+                req.message,
+                flags=re.IGNORECASE,
+            )
+            _cred_stripped = re.sub(r'[\s\-/,.:;!?]+', ' ', _cred_stripped).strip()
+            if _cred_stripped:
+                ctx_id = tools.ToolContext(
+                    db=db,
+                    session_id=req.session_id,
+                    customer_id=chat_session.customer_id,
+                    customer_email=None,
+                )
+                try:
+                    agent_reply, invocations = agent.run_agent(
+                        user_message=req.message,
+                        history=history,
+                        sentiment=user_sent,
+                        cumulative=cumulative,
+                        ctx=ctx_id,
+                    )
+                    reply_text = id_response + "\n\n" + agent_reply
+                    id_rag_sources = [
+                        RagSource(asin=h.asin, title=h.title, score=h.score,
+                                  category=h.category, price=h.price)
+                        for h in ctx_id.rag_hits
+                    ]
+                except Exception:
+                    log.exception("Agent failure after identification")
+
         db.add(Message(session_id=req.session_id, role="user", content=req.message,
-                       sentiment=sentiment.detect_sentiment(req.message),
-                       intent=sentiment.detect_intent(req.message)))
-        db.add(Message(session_id=req.session_id, role="assistant", content=id_response))
+                       sentiment=user_sent, intent=user_intent))
+        db.add(Message(session_id=req.session_id, role="assistant", content=reply_text,
+                       tools_called=[
+                           {"name": inv.name, "arguments": inv.arguments, "result": inv.result}
+                           for inv in invocations
+                       ]))
         db.commit()
         return ChatResponse(
-            reply=id_response,
-            sentiment=sentiment.detect_sentiment(req.message),
-            intent=sentiment.detect_intent(req.message),
+            reply=reply_text,
+            sentiment=user_sent,
+            intent=user_intent,
             escalated=False,
             customer_verified=customer_just_verified,
-            tools_called=[],
-            rag_sources=[],
+            tools_called=invocations,
+            rag_sources=id_rag_sources,
             session_id=req.session_id,
         )
 

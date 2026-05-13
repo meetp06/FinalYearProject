@@ -98,6 +98,18 @@ function renderEmpty(show) {
   empty.style.display = show ? "" : "none";
 }
 
+function deleteSession(id) {
+  const wasActive = state.sessionId === id;
+  delete state.sessions[id];
+  if (wasActive) {
+    const remaining = Object.values(state.sessions).sort((a, b) => b.created - a.created);
+    state.sessionId = remaining.length ? remaining[0].id : null;
+    ensureSession();
+  }
+  saveState();
+  renderAll();
+}
+
 function renderSessionList() {
   const list = $("#session-list");
   list.innerHTML = "";
@@ -113,6 +125,15 @@ function renderSessionList() {
     const title = document.createElement("span");
     title.textContent = s.title || "Untitled";
     li.appendChild(title);
+    const del = document.createElement("button");
+    del.className = "session-delete";
+    del.title = "Delete conversation";
+    del.textContent = "×";
+    del.addEventListener("click", (e) => {
+      e.stopPropagation();
+      deleteSession(s.id);
+    });
+    li.appendChild(del);
     li.addEventListener("click", () => {
       state.sessionId = s.id;
       saveState();

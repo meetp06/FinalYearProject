@@ -8,7 +8,7 @@ import httpx
 
 from . import tools
 from .schemas import ToolInvocation
-from .sentiment import detect_intent as _detect_intent
+from .sentiment import detect_intent as _detect_intent, _strip_product_phrases
 from .settings import get_settings
 
 log = logging.getLogger(__name__)
@@ -21,7 +21,9 @@ SYSTEM_PROMPT = (
     "NEVER ask the customer for their order number if it appears in the data below. "
     "When system data is provided, state those exact facts — order ID, carrier, dates, "
     "amounts, policy text — and do not add information from outside what is given. "
-    "Keep replies concise and to the point."
+    "REPLY IN 2-3 SENTENCES MAXIMUM. Be direct and specific. "
+    "Do NOT copy-paste policy text. Do NOT add caveats like 'it may vary' or 'contact support' "
+    "unless you have no other answer. Never start with 'I appreciate your message' or 'I see what you mean'."
 )
 
 _ORDER_ID_RE = re.compile(r'\bORD-[\w-]+\b', re.IGNORECASE)
@@ -32,6 +34,10 @@ _POLICY_KEYWORDS = {
     'delivered', 'arrived', 'received', 'package', 'never', 'wrong',
     'described', 'late', 'delayed', 'waiting', 'door', 'porch',
     'neighbor', 'left', 'nowhere', 'find',
+    # return condition / packaging
+    'opened', 'open box', 'condition', 'seal', 'packaging', 'original box',
+    'unwrap', 'used it', 'tried it', 'start a return', 'initiate a return',
+    'how to return', 'begin a return', 'process a return', 'steps to return',
 }
 _PRODUCT_KEYWORDS = {
     'recommend', 'suggest', 'looking for', 'show me', 'find me', 'best',
@@ -42,9 +48,18 @@ _PRODUCT_KEYWORDS = {
     'printer', 'router', 'backpack', 'suitcase', 'luggage', 'wallet',
     'jacket', 'clothing', 'glasses', 'sunglasses', 'book', 'vacuum',
     'blender', 'coffee', 'pillow', 'mattress', 'towel', 'bottle',
+    # additional coverage
+    'bundle', 'electronics', 'gadget', 'device', 'accessories', 'accessory',
+    'earphone', 'earbud', 'airpod', 'wearable', 'smartwatch', 'fitness tracker',
+    'features', 'specs', 'specifications', 'model', 'brand', 'series',
 }
-_ACCOUNT_KEYWORDS = {'account', 'membership', 'tier', 'profile', 'my info', 'member since',
-                     'how many orders', 'open orders', 'total orders', 'order history'}
+_ACCOUNT_KEYWORDS = {
+    'account', 'membership', 'tier', 'profile', 'my info', 'member since',
+    'how many orders', 'open orders', 'total orders', 'order history',
+    'recent orders', 'my orders', 'order count', 'orders i', 'orders placed',
+    'orders have i', 'my account info', 'account details', 'my profile',
+    'my membership', 'member benefits', 'my tier', 'account status',
+}
 _REFUND_KEYWORDS = {'refund', 'money back', 'charge back', 'reimbburse', 'reimburse'}
 _CANCEL_KEYWORDS = {
     'cancel my order', 'cancel the order', 'cancel order', 'i want to cancel',
@@ -53,6 +68,30 @@ _CANCEL_KEYWORDS = {
 }
 # Phrases that CONTAIN "cancel" but are NOT order-cancellation requests
 _CANCEL_FALSE_POSITIVES = {'noise cancel', 'noise-cancel', 'active cancel'}
+
+_ORDER_FOLLOWUP_RE = re.compile(
+    r'\b(carrier|when|eta|arrival|transit|tracking|estimated|update|'
+    r'late|early|delayed|status|same order|that order|expedite|delivery date|'
+    r'where|how long|still|yet|received|expect|location|it is|it\'s|'
+    r'wrong with|broken|defective|missing item|not arrived|'
+    r'items|contents|include|what is in|what\'s in|in it|in the order|'
+    r'what did i order|what was ordered|order details|order summary|'
+    r'that\'s it|yes that|this is it|that is it)\b',
+    re.IGNORECASE,
+)
+_PRODUCT_FOLLOWUP_RE = re.compile(
+    r'\b(yes|waterproof|battery|wireless|bluetooth|bass|'
+    r'volume|size|color|colour|brand|cheaper|better|similar|'
+    r'instead|alternative|what about|how about|does it|will it|'
+    r'is it|can it|any other|other option|the first|the second|that one)\b',
+    re.IGNORECASE,
+)
+_REFUND_FOLLOWUP_RE = re.compile(
+    r'\b(confirmed|confirm|processed|went through|refund|money back|'
+    r'how long|when will|appear|statement|bank|credit|receive|'
+    r'status|pending|done|complete|successful|approved|issued)\b',
+    re.IGNORECASE,
+)
 
 
 def _fmt_order(result: dict) -> str:
@@ -84,6 +123,55 @@ def _extract_order_id_from_history(history: List[dict]) -> str:
     return ""
 
 
+def _extract_last_product_query(history: List[dict]) -> str:
+    """Find the most recent user message that was a product search query."""
+    for msg in reversed(history[-6:]):
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            if any(k in content.lower() for k in _PRODUCT_KEYWORDS):
+                return content
+    return ""
+
+
+def _extract_prior_refund_order_id(history: List[dict]) -> str:
+    """Return the order ID from a refund that was processed earlier in this session."""
+    def _looks_like_refund_processed(content: str) -> bool:
+        c = content.lower()
+        # "Refund ID:" is always emitted by the template when process_refund succeeds
+        if "refund id" in c:
+            return True
+        # Personalized confirmation with a specific amount — never appears in policy text
+        if "your refund" in c and ("$" in content or "usd" in c):
+            return True
+        return False
+
+    if not any(
+        _looks_like_refund_processed(msg.get("content") or "")
+        for msg in history[-10:]
+        if msg.get("role") == "assistant"
+    ):
+        return ""
+    # Refund was confirmed — scan ALL messages (user + assistant) for an order ID
+    for msg in reversed(history[-10:]):
+        m = _ORDER_ID_RE.search(msg.get("content") or "")
+        if m:
+            return m.group(0).upper()
+    return ""
+
+
+def _in_order_mode(history: List[dict]) -> bool:
+    """Return True if a recent assistant message contains order status output."""
+    for msg in reversed(history[-4:]):
+        if msg.get("role") == "assistant":
+            content = msg.get("content", "")
+            if any(p in content for p in (
+                "Order Number:", "Order Status:", "Status is **",
+                "estimated delivery **", "Here's the latest on",
+            )):
+                return True
+    return False
+
+
 def _route_tools(
     message: str,
     ctx: tools.ToolContext,
@@ -91,7 +179,9 @@ def _route_tools(
 ) -> Tuple[List[ToolInvocation], str]:
     """Deterministically call tools based on message content.
     Returns (invocations, context_block_to_inject)."""
-    msg_lower = message.lower()
+    # Strip product/feature phrases before keyword matching so that e.g.
+    # "active noise cancellation" doesn't leak "cancellation" into cancel/policy routing.
+    msg_lower = _strip_product_phrases(message).lower()
     invocations: List[ToolInvocation] = []
     blocks: List[str] = []
 
@@ -154,7 +244,17 @@ def _route_tools(
 
     # Policy question — always search if keywords match (even with order ID)
     if any(k in msg_lower for k in _POLICY_KEYWORDS):
-        result = tools.execute_tool("search_policy_knowledge", {"query": message, "top_k": 3}, ctx)
+        # For short follow-ups, enrich the query with prior user message so RAG
+        # finds the right context (e.g. "what if i opened the box" after return question)
+        policy_query = message
+        if len(message.split()) <= 12 and history:
+            prior_user = next(
+                (m.get("content", "") for m in reversed(history[-6:]) if m.get("role") == "user"),
+                ""
+            )
+            if prior_user:
+                policy_query = f"{prior_user} {message}"
+        result = tools.execute_tool("search_policy_knowledge", {"query": policy_query, "top_k": 3}, ctx)
         invocations.append(ToolInvocation(name="search_policy_knowledge", arguments={"query": message}, result=result))
         for r in result.get("results", []):
             blocks.append(f"Policy ({r.get('topic','?')} - {r.get('section','?')}): {r.get('text','')}")
@@ -179,17 +279,6 @@ def _route_tools(
         )
 
     # ── Order context carryforward ────────────────────────────────────────────
-    # If the customer is identified, no tools fired yet, but there is a recent
-    # order in history, re-run lookup_order so the LLM can answer follow-up
-    # questions (e.g. "Who is the carrier?", "Is it late?") without the user
-    # having to repeat the order number.
-    _ORDER_FOLLOWUP_RE = re.compile(
-        r'\b(carrier|when|eta|arrival|transit|tracking|estimated|update|'
-        r'late|early|delayed|status|same order|that order|expedite|delivery date|'
-        r'where|how long|still|yet|received|expect|location|it is|it\'s|'
-        r'wrong with|broken|defective|missing item|not arrived)\b',
-        re.IGNORECASE,
-    )
     if (not any(inv.name == "lookup_order" for inv in invocations)
             and ctx.customer_id
             and history
@@ -203,6 +292,58 @@ def _route_tools(
                 result=result,
             ))
             blocks.append(_fmt_order(result))
+
+    # ── Product context carryforward ──────────────────────────────────────────
+    # If the user is refining a product search (no product keywords in this message)
+    # but there was a prior product query in history, re-run with the combined query.
+    # Guard: suppress when recent assistant messages look like order status replies.
+    if (not any(inv.name == "search_product_knowledge" for inv in invocations)
+            and history
+            and _PRODUCT_FOLLOWUP_RE.search(message)
+            and not _in_order_mode(history)):
+        last_query = _extract_last_product_query(history)
+        if last_query:
+            combined_query = last_query + " " + message
+            result = tools.execute_tool(
+                "search_product_knowledge",
+                {"query": combined_query, "top_k": 4},
+                ctx,
+            )
+            invocations.append(ToolInvocation(
+                name="search_product_knowledge",
+                arguments={"query": combined_query},
+                result=result,
+            ))
+            for r in result.get("results", []):
+                blocks.append(
+                    f"- {r.get('title','?')} | {r.get('category','?')} | "
+                    f"${r.get('price',0)} | {r.get('stars',0)} stars"
+                )
+
+    # ── Refund context carryforward ───────────────────────────────────────────
+    # If a refund was processed earlier in the session and this is a follow-up
+    # question about it, re-run process_refund lookup so the LLM has the data.
+    if (not any(inv.name == "process_refund" for inv in invocations)
+            and history
+            and _REFUND_FOLLOWUP_RE.search(message)
+            and not _ORDER_ID_RE.search(message)):  # avoid double-firing on new requests
+        prior_order_id = _extract_prior_refund_order_id(history)
+        if prior_order_id:
+            refund_result = tools.execute_tool(
+                "process_refund",
+                {"order_id": prior_order_id, "reason": "follow-up status check"},
+                ctx,
+            )
+            invocations.append(ToolInvocation(
+                name="process_refund",
+                arguments={"order_id": prior_order_id},
+                result=refund_result,
+            ))
+            blocks.append(
+                f"Refund ID: {refund_result.get('refund_id', 'N/A')}\n"
+                f"Refund Amount: {refund_result.get('amount', 'N/A')}\n"
+                f"Refund Status: {refund_result.get('status', 'N/A')}"
+            )
 
     context_block = "\n".join(blocks)
     return invocations, context_block
@@ -275,7 +416,7 @@ def _fill_placeholders(text: str, invocations: "List[ToolInvocation]") -> str:
         prefix = text[max(0, m.start() - 4): m.start()]
         if prefix.upper().endswith("ORD-") and isinstance(val, str) and val.upper().startswith("ORD-"):
             val = val[4:]
-        return val
+        return str(val)
 
     return re.sub(r'\{\{([^}]+)\}\}', _sub, text)
 
@@ -293,6 +434,16 @@ _STALL_RE = re.compile(
 _PLEASANTRY_RE = re.compile(
     r'\b(thank(s| you)|appreciate|great|awesome|perfect|wonderful|'
     r'that\'s all|that is all|no more|all good|you\'ve been|you have been)\b',
+    re.IGNORECASE,
+)
+_GREETING_RE = re.compile(
+    r'^\s*(hey|hi|hello|good\s+(morning|afternoon|evening)|howdy|hiya|sup|greetings)\s*[!.?]?\s*$',
+    re.IGNORECASE,
+)
+_ORDER_INTENT_RE = re.compile(
+    r'\b(my order|order details?|order status|order info(rmation)?|check (?:my )?order|'
+    r'see (?:my )?order|get (?:my )?order|order summary|recent order|last order|'
+    r'order number|what.*order|order.*detail|about (?:my )?order|view (?:my )?order)\b',
     re.IGNORECASE,
 )
 
@@ -383,10 +534,56 @@ def _reply_uses_account_data(reply: str, invocations: "List[ToolInvocation]") ->
     return False
 
 
+_BOILERPLATE_RE = re.compile(
+    r'\s*(If you have any (further |specific |additional |other )?'
+    r'(questions?|concerns?|issues?|inquiries?|details?|information)'
+    r'.*?$'
+    r'|please (don\'t hesitate|feel free) to (ask|reach out|contact).*?$'
+    r'|They will be able to provide.*?$'
+    r'|please (reach out|contact) (our|the) (customer )?support team.*?$'
+    r'|I\'m here to help.*?$)',
+    re.IGNORECASE | re.DOTALL,
+)
+
+_FILLER_START_RE = re.compile(
+    r'^(I (appreciate|see what you mean|understand|recognize) (your (message|concern|request|question)'
+    r'|that you|what you)[^.]*\.\s*'
+    r'|I see that you [^.]*\.\s*'
+    r'|It\'s clear to me that [^.]*\.\s*'
+    r'|It appears that you [^.]*\.\s*'
+    r'|Your message indicates that [^.]*\.\s*'
+    r'|Thank you for (reaching out|contacting|your message)[^.]*\.\s*'
+    r'|I realized that you [^.]*\.\s*'
+    r'|I can see that you [^.]*\.\s*'
+    r'|I notice that you [^.]*\.\s*)',
+    re.IGNORECASE,
+)
+
+
+def _trim_to_sentences(text: str, max_sentences: int = 4) -> str:
+    """Cut response to max_sentences, preserving markdown lists as one unit."""
+    # If response is a numbered/bulleted list, keep it as-is (it's already structured)
+    if re.search(r'^\s*\d+\.|\s*[-•*]\s', text, re.MULTILINE):
+        # Still strip boilerplate paragraph at the end
+        text = _BOILERPLATE_RE.sub('', text).strip()
+        return text
+    # Split on sentence boundaries
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    trimmed = ' '.join(sentences[:max_sentences])
+    return trimmed
+
+
 def _clean_reply(text: str) -> str:
     text = re.sub(r'\[TOOL_CALL\].*?(\}|\n|$)', '', text, flags=re.DOTALL)
     text = re.sub(r'\[TOOL_RESULT\].*?(\}|\n|$)', '', text, flags=re.DOTALL)
-    return text.strip()
+    text = text.strip()
+    # Strip filler opening sentence ("I appreciate your message! It's clear to me that...")
+    text = _FILLER_START_RE.sub('', text).strip()
+    # Strip boilerplate closing ("If you have any questions, contact support...")
+    text = _BOILERPLATE_RE.sub('', text).strip()
+    # Hard cap at 4 sentences
+    text = _trim_to_sentences(text, max_sentences=4)
+    return text
 
 
 def _messages_to_phi4_prompt(messages: List[dict]) -> str:
@@ -405,6 +602,7 @@ def _messages_to_phi4_prompt(messages: List[dict]) -> str:
 
 
 def _call_hf(messages: List[dict], max_new_tokens: int = 256) -> str:
+    """Call Hugging Face Inference Endpoint (Phi-4-mini)."""
     settings = get_settings()
     prompt = _messages_to_phi4_prompt(messages)
     try:
@@ -433,6 +631,52 @@ def _call_hf(messages: List[dict], max_new_tokens: int = 256) -> str:
         raise
 
 
+def _call_groq(messages: List[dict], max_tokens: int = 300) -> str:
+    """Call Groq's OpenAI-compatible chat completions API with automatic key fallback."""
+    settings = get_settings()
+    keys = [settings.groq_api_key]
+    if settings.groq_api_key_fallback:
+        keys.append(settings.groq_api_key_fallback)
+
+    last_exc = None
+    for i, api_key in enumerate(keys):
+        try:
+            resp = httpx.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": settings.llm_model,
+                    "messages": messages,
+                    "temperature": 0.1,
+                    "max_tokens": max_tokens,
+                },
+                timeout=settings.llm_timeout_seconds,
+            )
+            if not resp.is_success:
+                log.error("Groq key #%d error: %s", i + 1, resp.text[:500])
+                resp.raise_for_status()
+            result = resp.json()
+            return result["choices"][0]["message"]["content"]
+        except Exception as exc:
+            last_exc = exc
+            if i < len(keys) - 1:
+                log.warning("Groq key #%d failed, trying fallback key: %s", i + 1, exc)
+            else:
+                log.error("All Groq keys failed: %s", exc)
+    raise last_exc
+
+
+def _call_llm(messages: List[dict], max_tokens: int = 300) -> str:
+    """Route to the configured LLM provider."""
+    settings = get_settings()
+    if settings.llm_provider == "hf":
+        return _call_hf(messages, max_new_tokens=max_tokens)
+    return _call_groq(messages, max_tokens=max_tokens)
+
+
 def _augment_system(base: str, sentiment: str, cumulative: str) -> str:
     extras = []
     if cumulative == "frustrated":
@@ -458,15 +702,37 @@ def run_agent(
     # Step 1: deterministically call tools based on message content
     invocations, tool_context = _route_tools(user_message, ctx, history)
 
-    # Escalation intent — respond directly, no LLM needed
+    # Escalation intent — fire the tool to create a ticket + send email, then respond
     if _detect_intent(user_message) == "escalate_to_human":
+        esc_result = tools.execute_tool(
+            "escalate_to_human",
+            {"reason": user_message, "priority": "high"},
+            ctx,
+        )
+        invocations.append(ToolInvocation(
+            name="escalate_to_human",
+            arguments={"reason": user_message, "priority": "high"},
+            result=esc_result,
+        ))
+        ticket_id = esc_result.get("ticket_id", "")
+        wait = esc_result.get("estimated_wait", "a few minutes")
         return (
-            "I completely understand — I'm connecting you with a human support agent right now. "
-            "Please hold on. A member of our team will be with you shortly and will have full context of our conversation."
+            f"I completely understand — I've opened ticket **{ticket_id}** and a human support agent "
+            f"is being notified right now. Estimated wait: **{wait}**. "
+            "They'll have full context of our conversation. A confirmation email has been sent to you."
         ), invocations
 
     # If nothing was retrieved, skip the LLM — it will hallucinate without grounding
     if not invocations:
+        if _GREETING_RE.search(user_message):
+            return (
+                "Hi there! Welcome to Atlas support. How can I help you today?"
+            ), invocations
+        if _ORDER_INTENT_RE.search(user_message):
+            return (
+                "Sure! Could you share your order number? "
+                "It starts with ORD- and you'll find it in your confirmation email."
+            ), invocations
         if _PLEASANTRY_RE.search(user_message):
             return (
                 "You're very welcome! I'm glad I could help. "
@@ -503,7 +769,7 @@ def run_agent(
             messages.append({"role": role, "content": content})
     messages.append({"role": "user", "content": augmented_user})
 
-    reply = _call_hf(messages, max_new_tokens=300)
+    reply = _call_llm(messages, max_tokens=180)
     reply = _fill_placeholders(reply, invocations)
     reply = _clean_reply(reply)
 
@@ -520,6 +786,16 @@ def run_agent(
         template = _template_from_invocations(invocations)
         if template:
             log.info("LLM ignored order data — using template response")
+            # Append return guidance when this is a cancel follow-up on a shipped order
+            lookup_inv_sn2 = next((inv for inv in invocations if inv.name == "lookup_order"), None)
+            if (lookup_inv_sn2
+                    and "cancel" in user_message.lower()
+                    and lookup_inv_sn2.result.get("status", "").lower() == "shipped"
+                    and "return" not in template.lower()):
+                template += (
+                    " Since your order has already shipped, cancellation isn't possible. "
+                    "You can return it once it's delivered — just contact us to initiate a return within our standard return window."
+                )
             return template, invocations
 
     # Safety net 3: LLM called get_account_info but reply contains none of the account values
@@ -529,5 +805,62 @@ def run_agent(
         if template:
             log.info("LLM ignored account data — using template response")
             return template, invocations
+
+    # Safety net 4: cancel_order failed but LLM didn't mention the return path
+    cancel_inv = next((inv for inv in invocations if inv.name == "cancel_order"), None)
+    if cancel_inv and not cancel_inv.result.get("ok"):
+        if not any(w in reply.lower() for w in ("shipped", "return", "deliver")):
+            template = _template_from_invocations(invocations)
+            if template:
+                log.info("Cancel failed — LLM omitted return guidance, using template")
+                return template, invocations
+
+    # Safety net 5: process_refund was called but LLM reply doesn't include the
+    # Refund ID. Require "refund id" (not just "refund") so that the stored
+    # assistant message always contains a reliable marker that _looks_like_refund_processed
+    # can detect in subsequent turns.
+    has_refund_inv = any(inv.name == "process_refund" for inv in invocations)
+    if has_refund_inv and "refund id" not in reply.lower():
+        template = _template_from_invocations(invocations)
+        if template:
+            log.info("LLM omitted Refund ID — using template")
+            return template, invocations
+
+    # Post-process: follow-up about a failed cancel earlier in this session —
+    # check history so this works even when no lookup_order fired this turn.
+    if "cancel" in user_message.lower() and "return" not in reply.lower():
+        for msg in reversed((history or [])[-5:]):
+            if msg.get("role") == "assistant":
+                prev = (msg.get("content") or "").lower()
+                if ("unable to cancel" in prev
+                        or "already shipped" in prev
+                        or ("cancel" in prev and "shipped" in prev)):
+                    reply += (
+                        " Since your order has already shipped, cancellation isn't possible. "
+                        "You can return it once it's delivered — just contact us to initiate a return within our standard return window."
+                    )
+                    break
+
+    # Post-process: cancel in the current turn on a freshly-looked-up shipped order
+    lookup_inv = next((inv for inv in invocations if inv.name == "lookup_order"), None)
+    if (lookup_inv
+            and "cancel" in user_message.lower()
+            and lookup_inv.result.get("status", "").lower() == "shipped"
+            and "return" not in reply.lower()):
+        reply += (
+            " Since your order has already shipped, cancellation isn't possible at this stage. "
+            "However, you can return it once it's delivered — just initiate a return within our standard return window."
+        )
+
+    # ── Empathy prefix for unhappy customers ─────────────────────────────────
+    if reply and sentiment in {"frustrated", "negative"} or cumulative == "frustrated":
+        _EMPATHY_PREFIXES = {
+            "frustrated": "I'm truly sorry for the frustration — I understand how important this is to you. ",
+            "negative": "I'm sorry you're having this experience — let me help make it right. ",
+        }
+        prefix = _EMPATHY_PREFIXES.get(sentiment, _EMPATHY_PREFIXES.get(cumulative, ""))
+        # Only prepend if reply doesn't already start with an apology
+        if prefix and not any(reply.lower().startswith(w) for w in ("i'm sorry", "i'm truly", "i apologize", "my apologies")):
+            reply = prefix + reply
 
     return reply or "I'm here to help — could you clarify what you need?", invocations

@@ -73,6 +73,9 @@ def _needs_identification(message: str, history: list) -> bool:
         'policy', 'policies', 'warranty', 'guarantee', 'how long', 'how do i',
         'what is your', 'what are your', 'do you offer', 'do you have',
         'what if', 'can i', 'is it possible',
+        'what do i need', 'how to', 'steps to', 'how does', 'what happens',
+        'start a return', 'initiate a return', 'begin a return', 'process a return',
+        'opened', 'open box', 'condition', 'seal', 'packaging',
     ))
 
     # Bot explicitly asked for email — treat the current message as an identification response

@@ -494,10 +494,40 @@ a:hover {
   background: #f97316;
 }
 
-.session-list span:last-child {
+.session-list li > span:nth-of-type(2) {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  flex: 1;
+}
+
+.session-delete {
+  flex-shrink: 0;
+  margin-left: auto;
+  background: none;
+  border: none;
+  padding: 0 2px;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  color: transparent;
+  transition: color 0.12s;
+}
+
+.session-list li:hover .session-delete {
+  color: var(--muted);
+}
+
+.session-list li:hover .session-delete:hover {
+  color: #ef4444;
+}
+
+.session-list li.active .session-delete {
+  color: rgba(255,255,255,0.4);
+}
+
+.session-list li.active .session-delete:hover {
+  color: #fff;
 }
 
 /* ─ Main panel ──────────────────────────────────────────────────── */

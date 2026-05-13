@@ -18,6 +18,13 @@ class Settings(BaseSettings):
     # HF Inference Endpoint (fine-tuned Phi-4-mini)
     hf_endpoint_url: str = Field(default="")
     hf_token: str = Field(default="")
+
+    # Groq / OpenAI-compatible LLM
+    groq_api_key: str = Field(default="")
+    groq_api_key_fallback: str = Field(default="")
+    llm_model: str = Field(default="llama-3.3-70b-versatile")
+    llm_provider: str = Field(default="groq")  # "groq" or "hf"
+
     llm_timeout_seconds: float = Field(default=120.0)
     agent_max_steps: int = Field(default=6)
 

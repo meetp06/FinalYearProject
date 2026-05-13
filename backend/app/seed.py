@@ -26,7 +26,7 @@ RNG = random.Random(20260502)
 
 # ── 15 demo customers ──────────────────────────────────────────────────────────
 CUSTOMERS: List[Dict[str, Any]] = [
-    {"id": "1",  "name": "Demo Customer",     "email": "demo@atlas.local",               "tier": "Gold",     "days_ago": 365},
+    {"id": "1",  "name": "Demo Customer",     "email": "meetp0006@gmail.com",               "tier": "Gold",     "days_ago": 365},
     {"id": "2",  "name": "Alice Johnson",      "email": "alice.johnson@demo.atlas",       "tier": "Platinum", "days_ago": 720},
     {"id": "3",  "name": "Bob Martinez",       "email": "bob.martinez@demo.atlas",        "tier": "Silver",   "days_ago": 180},
     {"id": "4",  "name": "Carol Williams",     "email": "carol.williams@demo.atlas",      "tier": "Gold",     "days_ago": 540},
